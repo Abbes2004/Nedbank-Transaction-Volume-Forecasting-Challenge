@@ -1,0 +1,7 @@
+*.parquet
+*.csv
+*.zip
+*.pkl
+data/
+project/data/
+.ipynb_checkpoints/
