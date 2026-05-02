@@ -1,273 +1,204 @@
 """
-src/modeling/predict.py
-------------------------
-Generate test-set predictions by averaging across all K-fold models.
+predict.py
+===========
+Generate test-set predictions using the saved fold ensemble.
 
-Pipeline
+Strategy
 --------
-1. Load test_features.parquet
-2. Load each fold model from models/
-3. Predict log1p(y) for each fold → average ensemble
-4. Invert: expm1(avg_log_pred), clip to non-negative
-5. Round to nearest integer (target is a count)
-6. Write submissions/<timestamp>_submission.csv
+- Load all N fold models + their normalised weights
+- Load the selected feature list (from train.py's feature selection)
+- Predict with each fold model → weighted average in log1p space
+- Apply expm1, clip to PRED_FLOOR, round to integer
 
-Usage (standalone)
-------------------
+Fallback: if fold models are not found, falls back to single lgbm_model.pkl.
+
+Usage
+-----
     python src/modeling/predict.py
 """
 
-from __future__ import annotations
-
-import sys
-from datetime import datetime
-from pathlib import Path
+import os
+import pickle
 
 import numpy as np
 import pandas as pd
-import lightgbm as lgb
 
-_HERE = Path(__file__).resolve()
-sys.path.insert(0, str(_HERE.parents[2]))
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
 
-from src.utils.config import (           # noqa: E402
-    TEST_FEATURES,
-    MODELS_DIR,
-    SUBMISSIONS_DIR,
-    ID_COL,
-    TARGET_COL,
-    NON_FEATURE_COLS,
-    CV_N_FOLDS,
-)
-from src.utils.logger import get_logger  # noqa: E402
+MODELS_DIR        = "models"
+TEST_PATH         = "data/processed/test_features.parquet"
+SUBMIT_PATH       = "submissions/submission.csv"
+SAMPLE_PATH       = "data/raw/SampleSubmission.csv"
 
-logger = get_logger(__name__)
+FINAL_MODEL_PATH  = os.path.join(MODELS_DIR, "lgbm_model.pkl")
+FOLD_MODEL_TMPL   = os.path.join(MODELS_DIR, "fold_{fold}_model.pkl")
+FOLD_WEIGHTS_PATH = os.path.join(MODELS_DIR, "fold_weights.npy")
+SEL_FEATS_PATH    = os.path.join(MODELS_DIR, "selected_features.pkl")
+
+TARGET_COL  = "next_3m_txn_count"
+ID_COL      = "UniqueID"
+N_FOLDS     = 5
+PRED_FLOOR  = 1
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Data loading
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Loaders
+# ---------------------------------------------------------------------------
 
-def load_test(path: Path = TEST_FEATURES) -> pd.DataFrame:
-    """Load processed test parquet. Raises if file is missing."""
-    if not path.exists():
-        raise FileNotFoundError(f"Test features not found: {path}")
+def load_test_features(path: str = TEST_PATH) -> pd.DataFrame:
+    print(f"[INFO] Loading test features from: {path}")
     df = pd.read_parquet(path)
-    logger.info("Loaded test data: %d rows × %d cols", len(df), df.shape[1])
+    if ID_COL in df.columns:
+        df = df.set_index(ID_COL)
+    df = df.drop(columns=[TARGET_COL], errors="ignore")
+    print(f"[INFO] Test shape: {df.shape}")
     return df
 
 
-def extract_test_features(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
+def load_selected_features() -> list[str] | None:
+    if not os.path.exists(SEL_FEATS_PATH):
+        print("[WARN] selected_features.pkl not found — using all columns.")
+        return None
+    with open(SEL_FEATS_PATH, "rb") as f:
+        feats = pickle.load(f)
+    print(f"[INFO] Loaded {len(feats)} selected features.")
+    return feats
+
+
+def load_fold_models() -> tuple[list, np.ndarray] | tuple[None, None]:
     """
-    Split test dataframe into feature matrix X and ID series.
-
-    Returns
-    -------
-    X   : Feature matrix.
-    ids : UniqueID series.
+    Load all fold models and weights.
+    Returns (None, None) if any fold model file is missing.
     """
-    # Remove target-related columns if they accidentally leaked into test
-    drop_cols = [c for c in NON_FEATURE_COLS if c in df.columns and c != ID_COL]
-    ids = df[ID_COL].copy()
-    X   = df.drop(columns=[ID_COL] + drop_cols, errors="ignore").copy()
+    models  = []
+    weights = None
 
-    # Align dtypes: object/string → category
-    for col in X.select_dtypes(include=["object", "string"]).columns:
-        X[col] = X[col].astype("category")
+    for fold in range(1, N_FOLDS + 1):
+        path = FOLD_MODEL_TMPL.format(fold=fold)
+        if not os.path.exists(path):
+            print(f"[WARN] Fold model not found: {path}")
+            return None, None
+        with open(path, "rb") as f:
+            models.append(pickle.load(f))
 
-    logger.info("Test feature matrix: %d features", X.shape[1])
-    return X, ids
+    if os.path.exists(FOLD_WEIGHTS_PATH):
+        weights = np.load(FOLD_WEIGHTS_PATH)
+        print(f"[INFO] Fold weights: {[f'{w:.4f}' for w in weights]}")
+    else:
+        print("[WARN] fold_weights.npy not found — using equal weights.")
+        weights = np.ones(N_FOLDS) / N_FOLDS
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Model loading
-# ─────────────────────────────────────────────────────────────────────────────
-
-def load_fold_models(
-    models_dir: Path = MODELS_DIR,
-    n_folds: int = CV_N_FOLDS,
-) -> list[lgb.Booster]:
-    """
-    Load all fold Booster objects saved by train.py.
-
-    Parameters
-    ----------
-    models_dir : Directory containing lgbm_fold{k}.txt files.
-    n_folds    : Expected number of fold models.
-
-    Returns
-    -------
-    list of lgb.Booster
-    """
-    boosters: list[lgb.Booster] = []
-
-    for k in range(1, n_folds + 1):
-        model_path = models_dir / f"lgbm_fold{k}.txt"
-        if not model_path.exists():
-            raise FileNotFoundError(
-                f"Model not found: {model_path}\n"
-                "Run src/modeling/train.py first."
-            )
-        booster = lgb.Booster(model_file=str(model_path))
-        boosters.append(booster)
-        logger.info("Loaded model: %s", model_path.name)
-
-    logger.info("Total fold models loaded: %d", len(boosters))
-    return boosters
+    print(f"[INFO] Loaded {len(models)} fold models.")
+    return models, weights
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+def load_fallback_model():
+    print(f"[INFO] Loading fallback model: {FINAL_MODEL_PATH}")
+    with open(FINAL_MODEL_PATH, "rb") as f:
+        return pickle.load(f)
+
+
+# ---------------------------------------------------------------------------
 # Prediction
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 
 def predict_ensemble(
-    X: pd.DataFrame,
-    boosters: list[lgb.Booster],
+    fold_models:  list,
+    fold_weights: np.ndarray,
+    X:            pd.DataFrame,
 ) -> np.ndarray:
     """
-    Average log1p predictions across all fold boosters.
-
-    Parameters
-    ----------
-    X        : Test feature matrix.
-    boosters : Loaded fold Booster objects.
-
-    Returns
-    -------
-    np.ndarray of shape (n_samples,) — averaged log1p predictions.
+    Weighted average of fold model predictions in log1p space,
+    then expm1 + clip + round.
     """
-    fold_preds = np.zeros((len(X), len(boosters)), dtype=np.float64)
+    log_preds_stack = np.stack(
+        [model.predict(X) for model in fold_models],
+        axis=0,
+    )  # shape (n_folds, n_samples)
 
-    for i, booster in enumerate(boosters):
-        fold_preds[:, i] = booster.predict(X)
-        logger.info("Fold %d predictions generated.", i + 1)
+    # Weighted average in log1p space (more stable than raw space)
+    weighted_log = np.average(log_preds_stack, axis=0, weights=fold_weights)
 
-    avg_log_preds = fold_preds.mean(axis=1)
-    logger.info(
-        "Ensemble log1p pred — mean: %.4f | std: %.4f | min: %.4f | max: %.4f",
-        avg_log_preds.mean(),
-        avg_log_preds.std(),
-        avg_log_preds.min(),
-        avg_log_preds.max(),
-    )
-    return avg_log_preds
+    preds_raw = np.expm1(weighted_log)
+    preds_raw = np.clip(preds_raw, PRED_FLOOR, None)
+    return np.round(preds_raw).astype(int)
 
 
-def postprocess_predictions(log_preds: np.ndarray) -> np.ndarray:
-    """
-    Convert log1p predictions → integer counts.
-
-    Steps
-    -----
-    1. expm1  — invert log1p transform.
-    2. clip   — enforce non-negativity (RMSLE is undefined for negatives).
-    3. round  — target is an integer count.
-
-    Parameters
-    ----------
-    log_preds : Raw ensemble log1p predictions.
-
-    Returns
-    -------
-    np.ndarray of non-negative integers.
-    """
-    raw      = np.expm1(log_preds)
-    clipped  = np.clip(raw, a_min=0.0, a_max=None)
-    rounded  = np.round(clipped).astype(np.int64)
-
-    n_clipped = int(np.sum(raw < 0))
-    if n_clipped > 0:
-        logger.warning("%d predictions were clipped from negative to 0.", n_clipped)
-
-    logger.info(
-        "Final pred stats — mean: %.1f | median: %.1f | min: %d | max: %d",
-        rounded.mean(),
-        np.median(rounded),
-        rounded.min(),
-        rounded.max(),
-    )
-    return rounded
+def predict_single(model, X: pd.DataFrame) -> np.ndarray:
+    preds_log = model.predict(X)
+    preds_raw = np.expm1(preds_log)
+    preds_raw = np.clip(preds_raw, PRED_FLOOR, None)
+    return np.round(preds_raw).astype(int)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Submission writer
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Submission builder
+# ---------------------------------------------------------------------------
 
 def build_submission(
-    ids: pd.Series,
-    predictions: np.ndarray,
+    ids:   pd.Index,
+    preds: np.ndarray,
 ) -> pd.DataFrame:
-    """
-    Construct submission DataFrame in the required format.
+    sample = pd.read_csv(SAMPLE_PATH)
+    expected  = set(sample[ID_COL].values)
+    predicted = set(ids)
 
-    Parameters
-    ----------
-    ids         : UniqueID series.
-    predictions : Processed integer count predictions.
+    missing = expected - predicted
+    extra   = predicted - expected
 
-    Returns
-    -------
-    pd.DataFrame with columns [ID_COL, TARGET_COL].
-    """
-    return pd.DataFrame({
-        ID_COL:     ids.values,
-        TARGET_COL: predictions,
-    })
+    if missing:
+        raise ValueError(f"Missing {len(missing)} UniqueIDs in predictions.")
+    if extra:
+        raise ValueError(f"{len(extra)} unexpected UniqueIDs.")
 
+    sub = pd.DataFrame({ID_COL: ids, TARGET_COL: preds})
+    sub = sample[[ID_COL]].merge(sub, on=ID_COL, how="left")
 
-def save_submission(
-    sub: pd.DataFrame,
-    submissions_dir: Path = SUBMISSIONS_DIR,
-    filename: str | None = None,
-) -> Path:
-    """
-    Save submission CSV with a timestamped filename.
+    assert sub[TARGET_COL].isna().sum() == 0, "NaN predictions detected!"
+    assert (sub[TARGET_COL] < 0).sum()  == 0, "Negative predictions detected!"
 
-    Parameters
-    ----------
-    sub             : Submission DataFrame.
-    submissions_dir : Output directory.
-    filename        : Override filename (optional).
-
-    Returns
-    -------
-    Path of the saved CSV.
-    """
-    submissions_dir.mkdir(parents=True, exist_ok=True)
-
-    if filename is None:
-        ts       = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"{ts}_submission.csv"
-
-    out_path = submissions_dir / filename
-    sub.to_csv(out_path, index=False)
-    logger.info("Submission saved → %s  (%d rows)", out_path, len(sub))
-    return out_path
+    return sub
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+def save_submission(sub: pd.DataFrame, path: str = SUBMIT_PATH) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    sub.to_csv(path, index=False)
+    print(f"[INFO] Submission saved → {path}  ({len(sub):,} rows)")
+
+
+# ---------------------------------------------------------------------------
 # Entry point
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 
-def main() -> None:
-    logger.info("═══ Prediction pipeline started ═══")
+def main():
+    X = load_test_features()                          # ← 158 features, untouched
 
-    # Load test data
-    test_df         = load_test()
-    X_test, ids     = extract_test_features(test_df)
+    fold_models, fold_weights = load_fold_models()
 
-    # Load models
-    boosters        = load_fold_models()
+    if fold_models is not None:
+        print("[INFO] Using fold ensemble for prediction.")
+        # Fold models were trained on ALL 158 features — NO selection applied
+        preds = predict_ensemble(fold_models, fold_weights, X)
+    else:
+        print("[INFO] Using single final model for prediction.")
+        # Final model was retrained on 127 selected features — apply selection
+        selected = load_selected_features()
+        if selected is not None:
+            selected = [f for f in selected if f in X.columns]
+            X = X[selected]
+            print(f"[INFO] Test set after feature selection: {X.shape}")
+        model = load_fallback_model()
+        preds = predict_single(model, X)
 
-    # Predict
-    log_preds       = predict_ensemble(X_test, boosters)
-    final_preds     = postprocess_predictions(log_preds)
+    print(f"[INFO] Prediction stats: "
+          f"min={preds.min()}  max={preds.max()}  "
+          f"mean={preds.mean():.1f}  median={int(np.median(preds))}")
 
-    # Build and save submission
-    submission      = build_submission(ids, final_preds)
-    save_submission(submission)
-
-    logger.info("═══ Prediction pipeline complete ═══")
+    sub = build_submission(X.index, preds)
+    save_submission(sub)
+    print("[DONE] predict.py complete.")
 
 
 if __name__ == "__main__":

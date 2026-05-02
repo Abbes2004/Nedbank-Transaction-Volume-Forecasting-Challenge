@@ -1,35 +1,37 @@
 """
 build_financials_features.py
 ==============================
-Builds customer-level features from the raw financials parquet file.
+Builds customer-level features from the financial snapshots data.
 
-Features produced (1 row per UniqueID):
-  - Account counts       : total distinct accounts, by product type
-  - Snapshot coverage    : number of snapshots (months of data available)
-  - NetInterestIncome    : mean, std, min, max, last value, trend (last - first)
-  - NetInterestRevenue   : mean, std, min, max, last value
-  - Product flags        : binary indicator per product type
-  - Income trajectory    : slope of NII over time (simple linear proxy)
+Source   : data/raw/financials_features.parquet
+Output   : data/interim/financials_features.parquet
 
-Reference date: 2015-10-31 (consistent with transaction features).
-
-Usage:
-    python build_financials_features.py
-    python build_financials_features.py --input path/to/financials.parquet \\
-                                          --output path/to/out.parquet
+Features
+--------
+- Average / std / last balance (NetInterestIncome, NetInterestRevenue)
+- Balance volatility (std / |mean|)
+- Number of distinct accounts per customer
+- Number of distinct products per customer
+- Product-type indicators and counts (Transactional, Investments, Mortgages)
+- Loan-to-non-loan account ratio
+- Snapshot count (proxy for data richness / tenure)
+- Most recent snapshot values (last known state)
 """
 
-import argparse
 import os
+
 import numpy as np
 import pandas as pd
 
-# ── constants ────────────────────────────────────────────────────────────────
-REFERENCE_DATE = pd.Timestamp("2015-10-31")
-INPUT_PATH = "data/raw/financials_features.parquet"
-OUTPUT_PATH = "data/processed/financials_features_agg.parquet"
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
 
-REQUIRED_COLS = [
+CUTOFF_DATE = pd.Timestamp("2015-10-31")
+RAW_PATH    = "data/raw/financials_features.parquet"
+OUT_PATH    = "data/interim/financials_features.parquet"
+
+LOAD_COLS = [
     "UniqueID",
     "AccountID",
     "RunDate",
@@ -38,196 +40,202 @@ REQUIRED_COLS = [
     "NetInterestRevenue",
 ]
 
-PRODUCT_TYPES = ["Transactional", "Investments", "Mortgages"]
+LOAN_PRODUCTS      = {"Mortgages"}
+NON_LOAN_PRODUCTS  = {"Transactional", "Investments"}
 
 
-# ── loaders ──────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Loader
+# ---------------------------------------------------------------------------
 
-def load_financials(path: str) -> pd.DataFrame:
-    """Load required columns and parse dates."""
+def _load_financials(path: str = RAW_PATH) -> pd.DataFrame:
     print(f"[INFO] Loading financials from: {path}")
-    df = pd.read_parquet(path, columns=REQUIRED_COLS)
-    df["RunDate"] = pd.to_datetime(df["RunDate"])
-    print(f"[INFO] Loaded {len(df):,} rows for {df['UniqueID'].nunique():,} customers.")
-    return df
+    fin = pd.read_parquet(path, columns=LOAD_COLS)
+    fin["RunDate"] = pd.to_datetime(fin["RunDate"])
+    # Keep only snapshots up to cutoff (no leakage)
+    fin = fin[fin["RunDate"] <= CUTOFF_DATE].copy()
+    print(f"[INFO] {len(fin):,} rows after cutoff filter.")
+    return fin
 
 
-# ── feature builders ─────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Balance / income features
+# ---------------------------------------------------------------------------
 
-def build_account_count_features(df: pd.DataFrame) -> pd.DataFrame:
+def build_balance_features(fin: pd.DataFrame) -> pd.DataFrame:
     """
-    Count distinct accounts overall and per product type.
-    Note: Mortgages have null AccountID — we count UniqueID rows instead for them.
+    For NetInterestIncome and NetInterestRevenue compute:
+      mean, std, min, max, last value, volatility (std / |mean|).
     """
-    # Total distinct non-null AccountIDs
-    total_accs = (
-        df[df["AccountID"].notna()]
-        .groupby("UniqueID")["AccountID"]
-        .nunique()
-        .rename("n_distinct_accounts")
-        .reset_index()
-    )
-
-    # Rows per product type → proxy for "has this product"
-    product_counts = []
-    for product in PRODUCT_TYPES:
-        col = f"has_{product.lower()}"
-        flag = (
-            df[df["Product"] == product]
-            .groupby("UniqueID")
-            .size()
-            .gt(0)
-            .astype(int)
-            .rename(col)
-            .reset_index()
+    frames = []
+    for col in ["NetInterestIncome", "NetInterestRevenue"]:
+        agg = fin.groupby("UniqueID")[col].agg(
+            **{
+                f"{col}_mean": "mean",
+                f"{col}_std":  "std",
+                f"{col}_min":  "min",
+                f"{col}_max":  "max",
+                f"{col}_sum":  "sum",
+            }
         )
-        product_counts.append(flag)
+        # Last known value (most recent snapshot)
+        last = (
+            fin.sort_values("RunDate")
+            .groupby("UniqueID")[col]
+            .last()
+            .rename(f"{col}_last")
+        )
+        frames.append(pd.concat([agg, last], axis=1))
 
-    result = total_accs
-    for pc in product_counts:
-        result = result.merge(pc, on="UniqueID", how="outer")
-    result = result.fillna(0)
-    result["n_distinct_accounts"] = result["n_distinct_accounts"].astype(int)
-    return result
+    feat = pd.concat(frames, axis=1)
+
+    # Volatility ratios
+    for col in ["NetInterestIncome", "NetInterestRevenue"]:
+        feat[f"{col}_volatility"] = (
+            feat[f"{col}_std"] / feat[f"{col}_mean"].abs().clip(lower=1e-6)
+        )
+
+    return feat.fillna(0)
 
 
-def build_snapshot_coverage(df: pd.DataFrame) -> pd.DataFrame:
-    """Number of distinct RunDate snapshots per customer (data richness proxy)."""
-    coverage = (
-        df.groupby("UniqueID")["RunDate"]
+# ---------------------------------------------------------------------------
+# Account-level features
+# ---------------------------------------------------------------------------
+
+def build_account_features(fin: pd.DataFrame) -> pd.DataFrame:
+    """
+    n_accounts        : distinct AccountIDs (excluding null / Mortgage nulls)
+    n_products        : distinct Product types
+    has_mortgage      : 1/0 flag
+    has_investment    : 1/0 flag
+    has_transactional : 1/0 flag
+    loan_account_ratio: mortgage count / total account count
+    snapshot_count    : total snapshot rows (proxy for data richness)
+    """
+    # Non-null AccountIDs
+    non_null_acc = fin.dropna(subset=["AccountID"])
+    n_accounts = (
+        non_null_acc.groupby("UniqueID")["AccountID"]
         .nunique()
-        .rename("n_financial_snapshots")
-        .reset_index()
-    )
-    return coverage
-
-
-def build_nii_features(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    NetInterestIncome aggregations: mean, std, min, max, last value,
-    and a simple trend (last NII − first NII, ordered by RunDate).
-    """
-    df_sorted = df.sort_values("RunDate")
-
-    agg = df.groupby("UniqueID")["NetInterestIncome"].agg(
-        nii_mean="mean",
-        nii_std="std",
-        nii_min="min",
-        nii_max="max",
-    ).reset_index()
-    agg["nii_std"] = agg["nii_std"].fillna(0.0)
-
-    first_nii = (
-        df_sorted.groupby("UniqueID")["NetInterestIncome"]
-        .first()
-        .rename("nii_first")
-        .reset_index()
-    )
-    last_nii = (
-        df_sorted.groupby("UniqueID")["NetInterestIncome"]
-        .last()
-        .rename("nii_last")
-        .reset_index()
+        .rename("n_accounts")
     )
 
-    trend = first_nii.merge(last_nii, on="UniqueID")
-    trend["nii_trend"] = trend["nii_last"] - trend["nii_first"]
-
-    result = agg.merge(trend[["UniqueID", "nii_last", "nii_trend"]], on="UniqueID", how="left")
-    return result
-
-
-def build_nir_features(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    NetInterestRevenue aggregations: mean, std, min, max, last value.
-    """
-    df_sorted = df.sort_values("RunDate")
-
-    agg = df.groupby("UniqueID")["NetInterestRevenue"].agg(
-        nir_mean="mean",
-        nir_std="std",
-        nir_min="min",
-        nir_max="max",
-    ).reset_index()
-    agg["nir_std"] = agg["nir_std"].fillna(0.0)
-
-    last_nir = (
-        df_sorted.groupby("UniqueID")["NetInterestRevenue"]
-        .last()
-        .rename("nir_last")
-        .reset_index()
+    n_products = (
+        fin.groupby("UniqueID")["Product"]
+        .nunique()
+        .rename("n_products")
     )
-    result = agg.merge(last_nir, on="UniqueID", how="left")
-    return result
 
-
-def build_recency_feature(df: pd.DataFrame) -> pd.DataFrame:
-    """Days since the most recent financial snapshot relative to REFERENCE_DATE."""
-    last_snap = (
-        df.groupby("UniqueID")["RunDate"]
-        .max()
-        .reset_index()
+    snapshot_count = (
+        fin.groupby("UniqueID")
+        .size()
+        .rename("snapshot_count")
     )
-    last_snap["fin_recency_days"] = (REFERENCE_DATE - last_snap["RunDate"]).dt.days
-    return last_snap[["UniqueID", "fin_recency_days"]]
+
+    # Product flags
+    product_flags = {}
+    for prod, flag in [
+        ("Mortgages",      "has_mortgage"),
+        ("Investments",    "has_investment"),
+        ("Transactional",  "has_transactional"),
+    ]:
+        mask = fin[fin["Product"] == prod].groupby("UniqueID").size().gt(0).astype(int)
+        product_flags[flag] = mask.rename(flag)
+
+    # Loan ratio: number of Mortgage rows / total rows per customer
+    mortgage_rows = (
+        fin[fin["Product"].isin(LOAN_PRODUCTS)]
+        .groupby("UniqueID")
+        .size()
+        .rename("mortgage_row_count")
+    )
+
+    feat = pd.concat(
+        [n_accounts, n_products, snapshot_count] +
+        list(product_flags.values()) +
+        [mortgage_rows],
+        axis=1,
+    ).fillna(0)
+
+    feat["loan_account_ratio"] = (
+        feat["mortgage_row_count"] / feat["snapshot_count"].clip(lower=1)
+    )
+
+    return feat
 
 
-# ── orchestrator ─────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Trend in financial data
+# ---------------------------------------------------------------------------
 
-def build_financials_features(input_path: str, output_path: str) -> pd.DataFrame:
+def build_financial_trend(fin: pd.DataFrame) -> pd.DataFrame:
     """
-    Load raw financials and produce one feature row per customer.
-    Writes result to output_path and also returns the DataFrame.
+    Compare last 6 months vs all-time mean for NetInterestIncome.
+    Captures whether the customer's financial engagement is growing.
     """
-    df = load_financials(input_path)
+    last6_start = CUTOFF_DATE - pd.Timedelta(days=180)
+    recent  = fin[fin["RunDate"] > last6_start]
+    overall = fin
 
-    print("[INFO] Building account count features ...")
-    accounts = build_account_count_features(df)
+    recent_mean = (
+        recent.groupby("UniqueID")["NetInterestIncome"]
+        .mean()
+        .rename("nii_recent_mean")
+    )
+    overall_mean = (
+        overall.groupby("UniqueID")["NetInterestIncome"]
+        .mean()
+        .rename("nii_overall_mean")
+    )
 
-    print("[INFO] Building snapshot coverage ...")
-    coverage = build_snapshot_coverage(df)
+    trend = pd.concat([recent_mean, overall_mean], axis=1).fillna(0)
+    trend["nii_trend_ratio"] = (
+        trend["nii_recent_mean"] / trend["nii_overall_mean"].abs().clip(lower=1e-6)
+    )
 
-    print("[INFO] Building NetInterestIncome features ...")
-    nii = build_nii_features(df)
-
-    print("[INFO] Building NetInterestRevenue features ...")
-    nir = build_nir_features(df)
-
-    print("[INFO] Building financial recency feature ...")
-    recency = build_recency_feature(df)
-
-    # ── merge ──────────────────────────────────────────────────────────────
-    print("[INFO] Merging all financial feature tables ...")
-    feature_tables = [accounts, coverage, nii, nir, recency]
-    features = feature_tables[0]
-    for tbl in feature_tables[1:]:
-        features = features.merge(tbl, on="UniqueID", how="outer")
-
-    # NaN filling: numeric columns → 0 (customer not present in financials)
-    numeric_cols = features.select_dtypes(include=[np.number]).columns.tolist()
-    features[numeric_cols] = features[numeric_cols].fillna(0.0)
-
-    print(f"[INFO] Final shape: {features.shape}")
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    features.to_parquet(output_path, index=False)
-    print(f"[INFO] Saved to: {output_path}")
-    return features
+    return trend[["nii_recent_mean", "nii_trend_ratio"]]
 
 
-# ── CLI entry point ───────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Master builder
+# ---------------------------------------------------------------------------
+
+def build_financials_features(path: str = RAW_PATH) -> pd.DataFrame:
+    """
+    Full pipeline. Returns DataFrame indexed by UniqueID.
+    """
+    fin = _load_financials(path)
+
+    print("[INFO] Building balance features ...")
+    bal  = build_balance_features(fin)
+
+    print("[INFO] Building account features ...")
+    acc  = build_account_features(fin)
+
+    print("[INFO] Building financial trend features ...")
+    trnd = build_financial_trend(fin)
+
+    feats = pd.concat([bal, acc, trnd], axis=1).fillna(0)
+    feats.index.name = "UniqueID"
+
+    print(f"[INFO] Financial features shape: {feats.shape}")
+    return feats
+
+
+def save_features(feats: pd.DataFrame, out_path: str = OUT_PATH) -> None:
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    feats.reset_index().to_parquet(out_path, index=False)
+    print(f"[INFO] Saved → {out_path}")
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Build financials-level customer features.")
-    parser.add_argument("--input", default=INPUT_PATH, help="Path to financials parquet file.")
-    parser.add_argument("--output", default=OUTPUT_PATH, help="Path for output parquet file.")
-    args = parser.parse_args()
-
-    features = build_financials_features(args.input, args.output)
-
-    print("\n[SUMMARY] Feature columns:")
-    for col in features.columns:
-        print(f"  {col}")
-    print(f"\n[DONE] {features.shape[0]:,} customers, {features.shape[1]} features.")
+    feats = build_financials_features()
+    save_features(feats)
+    print("[DONE] build_financials_features complete.")
 
 
 if __name__ == "__main__":

@@ -1,7 +1,20 @@
-*.parquet
-*.csv
-*.zip
-*.pkl
-data/
-project/data/
+# ── Data ─────────────────────────────────────────────────────────────────────
+data/raw/*
+!data/raw/raw_data.zip
+
+data/interim/
+data/processed/
+
+# ── Models & generated files ─────────────────────────────────────────────────
+models/*
+
+# ── Submissions ───────────────────────────────────────────────────────────────
+submissions/*
+!submissions/submission.csv
+
+# ── Jupyter ───────────────────────────────────────────────────────────────────
 .ipynb_checkpoints/
+
+# ── Python cache ─────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc

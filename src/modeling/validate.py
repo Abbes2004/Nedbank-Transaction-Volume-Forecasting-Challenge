@@ -1,174 +1,138 @@
 """
-src/modeling/validate.py
--------------------------
-Offline validation using OOF predictions saved by train.py.
+validate.py
+============
+Offline validation utilities:
+  1. Score OOF predictions from train.py
+  2. Analyse prediction distribution vs training target distribution
+  3. Print error breakdown by target quantile (identifies where the model struggles)
 
-Computes RMSLE correctly by inverting the log1p transform before
-comparing to the raw integer target.
-
-Usage (standalone)
-------------------
+Usage
+-----
     python src/modeling/validate.py
 """
 
-from __future__ import annotations
-
-import sys
-from pathlib import Path
+import os
 
 import numpy as np
 import pandas as pd
 
-_HERE = Path(__file__).resolve()
-sys.path.insert(0, str(_HERE.parents[2]))
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
 
-from src.utils.config import (          # noqa: E402
-    MODELS_DIR,
-    TRAIN_FEATURES,
-    ID_COL,
-    TARGET_COL,
-    LOG_TARGET_COL,
-    OOF_FILENAME,
-)
-from src.utils.logger import get_logger  # noqa: E402
-
-logger = get_logger(__name__)
+OOF_PATH    = "data/processed/oof_predictions.csv"
+TRAIN_PATH  = "data/processed/train_features.parquet"
+TARGET_COL  = "next_3m_txn_count"
+ID_COL      = "UniqueID"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 # Metric
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 
 def rmsle(y_true: np.ndarray, y_pred: np.ndarray) -> float:
-    """
-    Root Mean Squared Logarithmic Error.
-
-    Parameters
-    ----------
-    y_true : Ground-truth counts (non-negative).
-    y_pred : Predicted counts (non-negative).
-
-    Returns
-    -------
-    float : RMSLE score.
-    """
-    y_true = np.asarray(y_true, dtype=np.float64)
-    y_pred = np.asarray(y_pred, dtype=np.float64)
-
-    if np.any(y_pred < 0):
-        raise ValueError("Predictions must be non-negative for RMSLE.")
-    if np.any(y_true < 0):
-        raise ValueError("Ground-truth values must be non-negative for RMSLE.")
-
+    y_pred = np.clip(y_pred, 0, None)
     return float(np.sqrt(np.mean((np.log1p(y_pred) - np.log1p(y_true)) ** 2)))
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Loaders
-# ─────────────────────────────────────────────────────────────────────────────
-
-def load_oof(models_dir: Path = MODELS_DIR) -> pd.DataFrame:
-    """Load OOF parquet written by train.py."""
-    oof_path = models_dir / OOF_FILENAME
-    if not oof_path.exists():
-        raise FileNotFoundError(
-            f"OOF file not found: {oof_path}\n"
-            "Run src/modeling/train.py first."
-        )
-    df = pd.read_parquet(oof_path)
-    logger.info("Loaded OOF predictions: %d rows", len(df))
-    return df
+def mae(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    return float(np.mean(np.abs(y_pred - y_true)))
 
 
-def load_raw_targets(train_path: Path = TRAIN_FEATURES) -> pd.DataFrame:
-    """
-    Load original integer targets from the processed training parquet.
-    Returns a DataFrame with [ID_COL, TARGET_COL].
-    """
-    if not train_path.exists():
-        raise FileNotFoundError(f"Training features not found: {train_path}")
-    cols = [ID_COL, TARGET_COL]
-    df   = pd.read_parquet(train_path, columns=cols)
-    logger.info("Loaded raw targets: %d rows", len(df))
-    return df
+# ---------------------------------------------------------------------------
+# OOF analysis
+# ---------------------------------------------------------------------------
 
+def validate_oof(oof_path: str = OOF_PATH) -> None:
+    """Score the OOF predictions file produced by train.py."""
+    print(f"[INFO] Loading OOF from: {oof_path}")
+    oof = pd.read_csv(oof_path)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Validation logic
-# ─────────────────────────────────────────────────────────────────────────────
+    y_true = oof[f"{TARGET_COL}_true"].values.astype(float)
+    y_pred = oof[f"{TARGET_COL}_pred"].values.astype(float)
 
-def compute_oof_rmsle(
-    oof_df: pd.DataFrame,
-    raw_targets: pd.DataFrame,
-) -> dict[str, float]:
-    """
-    Merge OOF predictions with raw integer targets and compute RMSLE.
+    overall_rmsle = rmsle(y_true, y_pred)
+    overall_mae   = mae(y_true, y_pred)
 
-    Parameters
-    ----------
-    oof_df      : Output of load_oof() — contains ID_COL and 'oof_log_pred'.
-    raw_targets : Output of load_raw_targets() — contains ID_COL and TARGET_COL.
+    print(f"\n{'='*50}")
+    print(f"  Overall RMSLE : {overall_rmsle:.6f}")
+    print(f"  Overall MAE   : {overall_mae:.2f}")
+    print(f"{'='*50}\n")
 
-    Returns
-    -------
-    dict with keys:
-        'rmsle'      : Full RMSLE on original count scale.
-        'rmse_log1p' : RMSE on log1p scale (directly comparable to training logs).
-        'n_rows'     : Number of OOF observations evaluated.
-    """
-    merged = oof_df.merge(raw_targets, on=ID_COL, how="inner")
+    # Error by quantile bucket
+    print("Error by target quantile bucket:")
+    print(f"  {'Bucket':<20} {'N':>6}  {'RMSLE':>8}  {'MAE':>8}  {'Mean True':>10}  {'Mean Pred':>10}")
+    print(f"  {'-'*70}")
 
-    if len(merged) != len(oof_df):
-        logger.warning(
-            "ID mismatch: OOF has %d rows, matched %d after merge.",
-            len(oof_df),
-            len(merged),
+    quantiles = [0, 0.1, 0.25, 0.5, 0.75, 0.9, 1.0]
+    thresholds = np.quantile(y_true, quantiles)
+
+    for i in range(len(quantiles) - 1):
+        lo = thresholds[i]
+        hi = thresholds[i + 1]
+        mask = (y_true >= lo) & (y_true <= hi)
+        if mask.sum() == 0:
+            continue
+        bucket_rmsle = rmsle(y_true[mask], y_pred[mask])
+        bucket_mae   = mae(y_true[mask], y_pred[mask])
+        label = f"P{int(quantiles[i]*100)}-P{int(quantiles[i+1]*100)}"
+        print(
+            f"  {label:<20} {mask.sum():>6}  {bucket_rmsle:>8.4f}  "
+            f"{bucket_mae:>8.1f}  {y_true[mask].mean():>10.1f}  {y_pred[mask].mean():>10.1f}"
         )
 
-    # Invert log1p → original count scale, clip negatives as a safety net
-    y_pred_raw = np.expm1(merged["oof_log_pred"].values)
-    y_pred_raw = np.clip(y_pred_raw, a_min=0.0, a_max=None)
+    # Distribution summary
+    print(f"\nPrediction distribution:")
+    print(f"  Min    : {y_pred.min():.1f}")
+    print(f"  P25    : {np.percentile(y_pred, 25):.1f}")
+    print(f"  Median : {np.median(y_pred):.1f}")
+    print(f"  Mean   : {y_pred.mean():.1f}")
+    print(f"  P75    : {np.percentile(y_pred, 75):.1f}")
+    print(f"  Max    : {y_pred.max():.1f}")
 
-    y_true_raw = merged[TARGET_COL].values.astype(np.float64)
-
-    score_rmsle     = rmsle(y_true_raw, y_pred_raw)
-    score_rmse_log  = float(
-        np.sqrt(np.mean((merged["oof_log_pred"].values - merged["y_log_true"].values) ** 2))
-    )
-
-    return {
-        "rmsle":      score_rmsle,
-        "rmse_log1p": score_rmse_log,
-        "n_rows":     len(merged),
-    }
-
-
-def print_validation_report(metrics: dict[str, float]) -> None:
-    """Print a human-readable validation summary to stdout."""
-    sep = "═" * 50
-    print(sep)
-    print("  OOF VALIDATION REPORT")
-    print(sep)
-    print(f"  Rows evaluated  : {metrics['n_rows']:,}")
-    print(f"  RMSLE (count)   : {metrics['rmsle']:.6f}   ← Zindi metric")
-    print(f"  RMSE (log1p)    : {metrics['rmse_log1p']:.6f}   ← training proxy")
-    print(sep)
+    print(f"\nTrue target distribution:")
+    print(f"  Min    : {y_true.min():.1f}")
+    print(f"  P25    : {np.percentile(y_true, 25):.1f}")
+    print(f"  Median : {np.median(y_true):.1f}")
+    print(f"  Mean   : {y_true.mean():.1f}")
+    print(f"  P75    : {np.percentile(y_true, 75):.1f}")
+    print(f"  Max    : {y_true.max():.1f}")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Feature null report
+# ---------------------------------------------------------------------------
+
+def validate_features(train_path: str = TRAIN_PATH) -> None:
+    """Check for missing values in the processed training set."""
+    print(f"\n[INFO] Checking feature quality in: {train_path}")
+    df = pd.read_parquet(train_path)
+    if ID_COL in df.columns:
+        df = df.set_index(ID_COL)
+
+    null_counts = df.isnull().sum()
+    null_cols   = null_counts[null_counts > 0]
+
+    if len(null_cols) == 0:
+        print("  [OK] No null values in processed features.")
+    else:
+        print(f"  [WARN] {len(null_cols)} columns with nulls:")
+        for col, count in null_cols.items():
+            pct = 100 * count / len(df)
+            print(f"    {col:<50} {count:>6}  ({pct:.1f}%)")
+
+    print(f"  Total features : {df.shape[1]}")
+    print(f"  Total rows     : {len(df):,}")
+
+
+# ---------------------------------------------------------------------------
 # Entry point
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 
-def main() -> None:
-    logger.info("═══ Validation pipeline started ═══")
-
-    oof_df      = load_oof()
-    raw_targets = load_raw_targets()
-    metrics     = compute_oof_rmsle(oof_df, raw_targets)
-
-    print_validation_report(metrics)
-    logger.info("RMSLE: %.6f", metrics["rmsle"])
-    logger.info("═══ Validation pipeline complete ═══")
+def main():
+    validate_features()
+    validate_oof()
+    print("\n[DONE] validate.py complete.")
 
 
 if __name__ == "__main__":

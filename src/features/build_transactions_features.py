@@ -1,251 +1,384 @@
 """
 build_transactions_features.py
 ================================
-Builds customer-level features from the raw transactions parquet file.
+Builds customer-level features from the raw transaction history.
 
-Features produced (1 row per UniqueID):
-  - Overall stats        : total count, amount stats (mean, std, min, max, median)
-  - Debit / Credit split : counts and amount sums
-  - Temporal windows     : last-30-day and last-90-day activity counts & amounts
-  - Recency              : days since last transaction (relative to REFERENCE_DATE)
-  - Frequency trends     : monthly transaction counts for the 3 months before cutoff
-  - Account diversity    : number of distinct accounts used
-  - Type diversity       : number of distinct TransactionTypeDescriptions
-  - Balance features     : last StatementBalance, mean & std StatementBalance
-  - Reversal rate        : fraction of transactions with a non-null ReversalTypeDescription
+Cutoff date      : 2015-10-31  (last date present in transactions data)
+Prediction window: Nov-2015 – Jan-2016  (3 months we are forecasting)
 
-Reference date: 2015-10-31 (last date in dataset, just before prediction window).
+Feature groups
+--------------
+A. Time-window aggregations : last 30 / 90 / 180 days
+B. Recency                  : days since last / first txn, activity span
+C. Frequency                : txn/month, txn/active-day, 90-day velocity
+D. Behavioural              : debit vs credit stats, net flow, volatility
+E. Trend                    : last-3M vs prior-3M count / amount growth
+F. Type-level               : per-type count + fraction, diversity score
+G. Seasonality              : historical Nov-Jan activity fraction
 
-Usage:
-    python build_transactions_features.py
-    python build_transactions_features.py --input path/to/transactions.parquet \\
-                                           --output path/to/out.parquet
+Output
+------
+data/interim/transactions_features.parquet
 """
 
-import argparse
 import os
+
 import numpy as np
 import pandas as pd
-import pyarrow.parquet as pq
 
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
 
-# ── constants ────────────────────────────────────────────────────────────────
-REFERENCE_DATE = pd.Timestamp("2015-10-31")
-INPUT_PATH = "data/raw/transactions_features.parquet"
-OUTPUT_PATH = "data/processed/transactions_features_agg.parquet"
+CUTOFF_DATE = pd.Timestamp("2015-10-31")
+RAW_PATH    = "data/raw/transactions_features.parquet"
+OUT_PATH    = "data/interim/transactions_features.parquet"
 
-# Only load the columns we actually need — critical for 18 M-row dataset
-REQUIRED_COLS = [
+LOAD_COLS = [
     "UniqueID",
-    "AccountID",
     "TransactionDate",
     "TransactionAmount",
     "TransactionTypeDescription",
-    "IsDebitCredit",
-    "StatementBalance",
-    "ReversalTypeDescription",
+]
+
+WINDOWS_DAYS = [30, 90, 180]
+
+TOP_TYPES = [
+    "Transfers & Payments",
+    "Charges & Fees",
+    "Interest & Investments",
+    "Debit Orders & Standing Orders",
+    "Withdrawals",
+    "Foreign Exchange",
 ]
 
 
-# ── loaders ──────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Helper
+# ---------------------------------------------------------------------------
 
-def load_transactions(path):
-
-    table = pq.ParquetFile(path)
-
-    for batch in table.iter_batches(batch_size=500_000):
-        yield batch.to_pandas()
-
-
-# ── feature builders ─────────────────────────────────────────────────────────
-
-def build_overall_stats(df: pd.DataFrame) -> pd.DataFrame:
-    """Global transaction count and amount aggregations per customer."""
-    grp = df.groupby("UniqueID")
-    stats = grp["TransactionAmount"].agg(
-        txn_count="count",
-        amount_mean="mean",
-        amount_std="std",
-        amount_min="min",
-        amount_max="max",
-        amount_median="median",
-        amount_sum="sum",
-    ).reset_index()
-    stats["amount_std"] = stats["amount_std"].fillna(0.0)
-    return stats
+def _type_col_name(t: str) -> str:
+    """Convert a type description to a safe column suffix."""
+    return (
+        t.lower()
+        .replace(" & ", "_and_")
+        .replace("& ", "_and_")
+        .replace(" / ", "_")
+        .replace("/ ", "_")
+        .replace(" ", "_")
+    )
 
 
-def build_debit_credit_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Debit vs Credit counts and total amounts."""
-    debit = df[df["IsDebitCredit"] == "D"].groupby("UniqueID").agg(
-        debit_count=("TransactionAmount", "count"),
-        debit_sum=("TransactionAmount", "sum"),
-    ).reset_index()
+# ---------------------------------------------------------------------------
+# A. Time-window aggregations
+# ---------------------------------------------------------------------------
 
-    credit = df[df["IsDebitCredit"] == "C"].groupby("UniqueID").agg(
-        credit_count=("TransactionAmount", "count"),
-        credit_sum=("TransactionAmount", "sum"),
-    ).reset_index()
+def build_window_features(txn: pd.DataFrame) -> pd.DataFrame:
+    """
+    For each window w in WINDOWS_DAYS compute per-customer:
+      txn_count, amount_sum, amount_mean, amount_std, amount_max, amount_min,
+      active_days (unique calendar days with at least one transaction).
+    """
+    frames = []
+    for w in WINDOWS_DAYS:
+        start  = CUTOFF_DATE - pd.Timedelta(days=w)
+        subset = txn[txn["TransactionDate"] > start]
 
-    combined = debit.merge(credit, on="UniqueID", how="outer").fillna(0.0)
+        agg = subset.groupby("UniqueID")["TransactionAmount"].agg(
+            **{
+                f"txn_count_{w}d":   "count",
+                f"amount_sum_{w}d":  "sum",
+                f"amount_mean_{w}d": "mean",
+                f"amount_std_{w}d":  "std",
+                f"amount_max_{w}d":  "max",
+                f"amount_min_{w}d":  "min",
+            }
+        )
+        active_days = (
+            subset.groupby("UniqueID")["TransactionDate"]
+            .nunique()
+            .rename(f"active_days_{w}d")
+        )
+        frames.append(pd.concat([agg, active_days], axis=1))
 
-    # Derived ratio — avoid divide-by-zero
-    total = combined["debit_count"] + combined["credit_count"]
-    combined["debit_ratio"] = np.where(total > 0, combined["debit_count"] / total, 0.0)
-    return combined
+    return pd.concat(frames, axis=1)
 
 
-def build_window_features(df: pd.DataFrame, days: int, prefix: str) -> pd.DataFrame:
-    """Transaction count and total amount in the last `days` days."""
-    cutoff = REFERENCE_DATE - pd.Timedelta(days=days)
-    window = df[df["TransactionDate"] > cutoff]
-    feats = window.groupby("UniqueID").agg(
-        **{
-            f"{prefix}_txn_count": ("TransactionAmount", "count"),
-            f"{prefix}_amount_sum": ("TransactionAmount", "sum"),
-            f"{prefix}_amount_mean": ("TransactionAmount", "mean"),
-        }
-    ).reset_index()
+# ---------------------------------------------------------------------------
+# B. Recency features
+# ---------------------------------------------------------------------------
+
+def build_recency_features(txn: pd.DataFrame) -> pd.DataFrame:
+    """Days since last / first transaction and total activity span in days."""
+    grp = txn.groupby("UniqueID")["TransactionDate"].agg(["max", "min"])
+    grp.columns = ["last_txn_date", "first_txn_date"]
+
+    grp["days_since_last_txn"]  = (CUTOFF_DATE - grp["last_txn_date"]).dt.days
+    grp["days_since_first_txn"] = (CUTOFF_DATE - grp["first_txn_date"]).dt.days
+    grp["activity_span_days"]   = (grp["last_txn_date"] - grp["first_txn_date"]).dt.days
+
+    return grp[["days_since_last_txn", "days_since_first_txn", "activity_span_days"]]
+
+
+# ---------------------------------------------------------------------------
+# C. Frequency features
+# ---------------------------------------------------------------------------
+
+def build_frequency_features(
+    txn:     pd.DataFrame,
+    recency: pd.DataFrame,
+    window:  pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    total_txn_count       : all-time transaction count
+    total_active_days     : unique days with at least one transaction (all-time)
+    txn_per_month         : total count / active months (activity_span-based)
+    txn_per_active_day    : total count / unique active days
+    avg_txn_per_month_90d : txn_count_90d / 3  (most recent velocity)
+    """
+    total        = txn.groupby("UniqueID").size().rename("total_txn_count")
+    unique_days  = (
+        txn.groupby("UniqueID")["TransactionDate"]
+        .nunique()
+        .rename("total_active_days")
+    )
+
+    feat = pd.concat([total, unique_days, recency], axis=1)
+
+    months_active             = (feat["activity_span_days"] / 30.0).clip(lower=1)
+    feat["txn_per_month"]     = feat["total_txn_count"] / months_active
+    feat["txn_per_active_day"] = (
+        feat["total_txn_count"] / feat["total_active_days"].clip(lower=1)
+    )
+    feat["avg_txn_per_month_90d"] = window["txn_count_90d"] / 3.0
+
+    return feat[[
+        "total_txn_count",
+        "total_active_days",
+        "txn_per_month",
+        "txn_per_active_day",
+        "avg_txn_per_month_90d",
+    ]]
+
+
+# ---------------------------------------------------------------------------
+# D. Behavioural features
+# ---------------------------------------------------------------------------
+
+def build_behavioral_features(txn: pd.DataFrame) -> pd.DataFrame:
+    """
+    debit_count / debit_sum    : negative-amount transactions
+    credit_count / credit_sum  : positive-amount transactions
+    debit_credit_ratio         : |debit_sum| / credit_sum
+    debit_fraction             : debit_count / total
+    zero_txn_fraction          : zero-amount rows / total
+    net_flow                   : credit_sum + debit_sum  (signed)
+    amount_volatility          : std / |mean|  (coefficient of variation)
+    """
+    debits  = txn[txn["TransactionAmount"] < 0].groupby("UniqueID")["TransactionAmount"].agg(
+        debit_count="count",
+        debit_sum="sum",
+    )
+    credits = txn[txn["TransactionAmount"] > 0].groupby("UniqueID")["TransactionAmount"].agg(
+        credit_count="count",
+        credit_sum="sum",
+    )
+    zeros = (
+        (txn["TransactionAmount"] == 0)
+        .groupby(txn["UniqueID"])
+        .sum()
+        .rename("zero_txn_count")
+    )
+    total_stats = txn.groupby("UniqueID")["TransactionAmount"].agg(
+        all_count="count",
+        all_mean="mean",
+        all_std="std",
+    )
+
+    feat = pd.concat([debits, credits, zeros, total_stats], axis=1).fillna(0)
+
+    feat["debit_credit_ratio"] = (
+        feat["debit_sum"].abs() / feat["credit_sum"].clip(lower=1)
+    )
+    feat["debit_fraction"]   = feat["debit_count"]   / feat["all_count"].clip(lower=1)
+    feat["zero_txn_fraction"] = feat["zero_txn_count"] / feat["all_count"].clip(lower=1)
+    feat["net_flow"]          = feat["credit_sum"] + feat["debit_sum"]
+    feat["amount_volatility"] = feat["all_std"] / feat["all_mean"].abs().clip(lower=1e-6)
+
+    return feat[[
+        "debit_count", "debit_sum",
+        "credit_count", "credit_sum",
+        "debit_credit_ratio", "debit_fraction",
+        "zero_txn_fraction", "net_flow",
+        "amount_volatility",
+    ]]
+
+
+# ---------------------------------------------------------------------------
+# E. Trend features (last-3M vs prior-3M)
+# ---------------------------------------------------------------------------
+
+def build_trend_features(txn: pd.DataFrame) -> pd.DataFrame:
+    """
+    last3_count   : transactions in the most recent 90 days
+    prior3_count  : transactions in the 90 days before that
+    txn_count_growth   : (last3 - prior3) / prior3
+    amount_sum_growth  : (last3_sum - prior3_sum) / |prior3_sum|
+    """
+    last3_start  = CUTOFF_DATE - pd.Timedelta(days=90)
+    prior3_start = CUTOFF_DATE - pd.Timedelta(days=180)
+
+    last3  = txn[txn["TransactionDate"] > last3_start].groupby("UniqueID").agg(
+        last3_count=("TransactionAmount", "count"),
+        last3_sum=("TransactionAmount",   "sum"),
+    )
+    prior3 = txn[
+        (txn["TransactionDate"] >  prior3_start) &
+        (txn["TransactionDate"] <= last3_start)
+    ].groupby("UniqueID").agg(
+        prior3_count=("TransactionAmount", "count"),
+        prior3_sum=("TransactionAmount",   "sum"),
+    )
+
+    trend = pd.concat([last3, prior3], axis=1).fillna(0)
+
+    trend["txn_count_growth"] = (
+        (trend["last3_count"] - trend["prior3_count"]) /
+        trend["prior3_count"].clip(lower=1)
+    )
+    trend["amount_sum_growth"] = (
+        (trend["last3_sum"] - trend["prior3_sum"]) /
+        trend["prior3_sum"].abs().clip(lower=1e-6)
+    )
+
+    return trend[["last3_count", "prior3_count", "txn_count_growth", "amount_sum_growth"]]
+
+
+# ---------------------------------------------------------------------------
+# F. Transaction-type features
+# ---------------------------------------------------------------------------
+
+def build_type_features(txn: pd.DataFrame) -> pd.DataFrame:
+    """
+    For each top transaction type:
+      type_<name>_count : raw count
+      type_<name>_frac  : fraction of total transactions
+    Plus txn_type_diversity : number of unique types used by customer.
+    """
+    total     = txn.groupby("UniqueID").size().rename("_total")
+    diversity = (
+        txn.groupby("UniqueID")["TransactionTypeDescription"]
+        .nunique()
+        .rename("txn_type_diversity")
+    )
+
+    frames = [diversity]
+    for t in TOP_TYPES:
+        col   = _type_col_name(t)
+        count = (
+            txn[txn["TransactionTypeDescription"] == t]
+            .groupby("UniqueID")
+            .size()
+            .rename(f"type_{col}_count")
+        )
+        frames.append(count)
+
+    feat = pd.concat(frames, axis=1).fillna(0)
+
+    # Add fractions
+    total_aligned = total.reindex(feat.index).clip(lower=1)
+    for t in TOP_TYPES:
+        col = _type_col_name(t)
+        feat[f"type_{col}_frac"] = feat[f"type_{col}_count"] / total_aligned
+
+    return feat
+
+
+# ---------------------------------------------------------------------------
+# G. Holiday seasonality proxy
+# ---------------------------------------------------------------------------
+
+def build_seasonality_features(txn: pd.DataFrame) -> pd.DataFrame:
+    """
+    nov_jan_txn_count_hist : historical transactions in Nov-Jan months
+    nov_jan_txn_frac       : fraction of all transactions in Nov-Jan
+    These capture whether a customer is seasonally active in the prediction window.
+    """
+    nov_jan       = txn[txn["TransactionDate"].dt.month.isin([11, 12, 1])]
+    nov_jan_count = nov_jan.groupby("UniqueID").size().rename("nov_jan_txn_count_hist")
+    total         = txn.groupby("UniqueID").size().rename("_total_s")
+
+    feat = pd.concat([nov_jan_count, total], axis=1).fillna(0)
+    feat["nov_jan_txn_frac"] = feat["nov_jan_txn_count_hist"] / feat["_total_s"].clip(lower=1)
+
+    return feat[["nov_jan_txn_count_hist", "nov_jan_txn_frac"]]
+
+
+# ---------------------------------------------------------------------------
+# Master builder
+# ---------------------------------------------------------------------------
+
+def build_transactions_features(path: str = RAW_PATH) -> pd.DataFrame:
+    """
+    Run the full feature engineering pipeline.
+    Returns a DataFrame with UniqueID as index.
+    """
+    txn = _load_transactions(path)
+
+    print("[INFO] A. Time-window features ...")
+    win = build_window_features(txn)
+
+    print("[INFO] B. Recency features ...")
+    rec = build_recency_features(txn)
+
+    print("[INFO] C. Frequency features ...")
+    frq = build_frequency_features(txn, rec, win)
+
+    print("[INFO] D. Behavioural features ...")
+    beh = build_behavioral_features(txn)
+
+    print("[INFO] E. Trend features ...")
+    trn = build_trend_features(txn)
+
+    print("[INFO] F. Type-level features ...")
+    typ = build_type_features(txn)
+
+    print("[INFO] G. Seasonality features ...")
+    sea = build_seasonality_features(txn)
+
+    feats = pd.concat([win, rec, frq, beh, trn, typ, sea], axis=1)
+    feats = feats.fillna(0)
+    feats.index.name = "UniqueID"
+
+    print(f"[INFO] Final shape: {feats.shape}  ({feats.shape[1]} features, {len(feats):,} customers)")
     return feats
 
 
-def build_recency_feature(df: pd.DataFrame) -> pd.DataFrame:
-    """Days since the customer's most recent transaction."""
-    last_date = df.groupby("UniqueID")["TransactionDate"].max().reset_index()
-    last_date.columns = ["UniqueID", "last_txn_date"]
-    last_date["recency_days"] = (REFERENCE_DATE - last_date["last_txn_date"]).dt.days
-    return last_date[["UniqueID", "recency_days"]]
+def _load_transactions(path: str) -> pd.DataFrame:
+    """Load transactions parquet with column selection and cutoff filter."""
+    print(f"[INFO] Loading: {path}")
+    txn = pd.read_parquet(path, columns=LOAD_COLS)
+    txn["TransactionDate"] = pd.to_datetime(txn["TransactionDate"])
+    # Hard cutoff — no future leakage
+    txn = txn[txn["TransactionDate"] <= CUTOFF_DATE].copy()
+    print(f"[INFO] {len(txn):,} rows after cutoff filter.")
+    return txn
 
 
-def build_monthly_trend_features(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Transaction counts for each of the 3 months immediately before the cutoff:
-    Aug, Sep, Oct 2015. Captures recent trend momentum.
-    """
-    months = {
-        "m_aug2015": ("2015-08-01", "2015-08-31"),
-        "m_sep2015": ("2015-09-01", "2015-09-30"),
-        "m_oct2015": ("2015-10-01", "2015-10-31"),
-    }
-    frames = []
-    for col_name, (start, end) in months.items():
-        mask = (df["TransactionDate"] >= start) & (df["TransactionDate"] <= end)
-        cnt = (
-            df[mask]
-            .groupby("UniqueID")["TransactionAmount"]
-            .count()
-            .rename(col_name)
-            .reset_index()
-        )
-        frames.append(cnt)
-
-    trend = frames[0]
-    for f in frames[1:]:
-        trend = trend.merge(f, on="UniqueID", how="outer")
-    trend = trend.fillna(0.0)
-
-    # Simple slope: oct - aug  (positive = increasing activity)
-    trend["trend_slope_3m"] = trend["m_oct2015"] - trend["m_aug2015"]
-    return trend
+def save_features(feats: pd.DataFrame, out_path: str = OUT_PATH) -> None:
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    feats.reset_index().to_parquet(out_path, index=False)
+    print(f"[INFO] Saved → {out_path}")
 
 
-def build_diversity_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Number of distinct accounts and transaction types per customer."""
-    account_div = (
-        df.groupby("UniqueID")["AccountID"]
-        .nunique()
-        .rename("n_distinct_accounts")
-        .reset_index()
-    )
-    type_div = (
-        df.groupby("UniqueID")["TransactionTypeDescription"]
-        .nunique()
-        .rename("n_txn_types")
-        .reset_index()
-    )
-    return account_div.merge(type_div, on="UniqueID", how="outer")
-
-
-def build_balance_features(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    StatementBalance-based features: last balance, mean, and std.
-    Sorted by date to ensure 'last' is the most recent.
-    """
-    df_sorted = df.sort_values("TransactionDate")
-    last_bal = (
-        df_sorted.groupby("UniqueID")["StatementBalance"]
-        .last()
-        .rename("last_statement_balance")
-        .reset_index()
-    )
-    bal_stats = df.groupby("UniqueID")["StatementBalance"].agg(
-        balance_mean="mean",
-        balance_std="std",
-    ).reset_index()
-    bal_stats["balance_std"] = bal_stats["balance_std"].fillna(0.0)
-    return last_bal.merge(bal_stats, on="UniqueID", how="left")
-
-
-def build_reversal_feature(df: pd.DataFrame) -> pd.DataFrame:
-    """Fraction of transactions that are reversals."""
-    df = df.copy()
-    df["is_reversal"] = df["ReversalTypeDescription"].notna().astype(int)
-    rev = df.groupby("UniqueID").agg(
-        reversal_count=("is_reversal", "sum"),
-        reversal_rate=("is_reversal", "mean"),
-    ).reset_index()
-    return rev
-
-
-# ── orchestrator ─────────────────────────────────────────────────────────────
-
-def build_transaction_features(input_path, output_path):
-    
-
-    agg_list = []
-
-    for chunk in load_transactions(input_path):
-        # conversions légères
-        chunk["TransactionDate"] = pd.to_datetime(chunk["TransactionDate"])
-
-        # features simples (exemple)
-        chunk["TransactionAmount"] = chunk["TransactionAmount"].astype("float32")
-        chunk["UniqueID"] = chunk["UniqueID"].astype("category")
-
-        chunk["is_debit"] = (chunk["TransactionAmount"] < 0).astype(int)
-        chunk["is_credit"] = (chunk["TransactionAmount"] > 0).astype(int)
-
-        grp = chunk.groupby("UniqueID").agg(
-            txn_count=("TransactionAmount", "count"),
-            txn_sum=("TransactionAmount", "sum"),
-            debit_count=("is_debit", "sum"),
-            credit_count=("is_credit", "sum"),
-            txn_mean=("TransactionAmount", "mean"),
-        )
-
-        agg_list.append(grp)
-
-    # merge final (safe memory)
-    final = pd.concat(agg_list).groupby(level=0).sum().reset_index()
-    final.to_parquet(output_path)
-    print(final.columns)
-    return final
-
-
-# ── CLI entry point ───────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Build transaction-level customer features.")
-    parser.add_argument("--input", default=INPUT_PATH, help="Path to transactions parquet file.")
-    parser.add_argument("--output", default=OUTPUT_PATH, help="Path for output parquet file.")
-    args = parser.parse_args()
-
-    features = build_transaction_features(args.input, args.output)
-
-    print("\n[SUMMARY] Feature columns:")
-    for col in features.columns:
-        print(f"  {col}")
-    print(f"\n[DONE] {features.shape[0]:,} customers, {features.shape[1]} features.")
+    feats = build_transactions_features()
+    save_features(feats)
+    print(f"[DONE] build_transactions_features complete.")
 
 
 if __name__ == "__main__":

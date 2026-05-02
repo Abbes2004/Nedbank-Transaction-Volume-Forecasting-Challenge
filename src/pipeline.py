@@ -1,114 +1,181 @@
 """
-src/pipeline.py
----------------
-End-to-end orchestration: train → validate → predict.
+pipeline.py
+============
+End-to-end pipeline orchestrator for the Nedbank Transaction Forecasting Challenge.
 
-This script is the single entry point for a full run. It delegates to the
-individual modules in src/modeling/ and reports the final RMSLE.
+Steps
+-----
+1. transactions  → data/interim/transactions_features.parquet
+2. financials    → data/interim/financials_features.parquet
+3. demographics  → data/interim/demographics_features.parquet
+4. merge         → data/processed/train_features.parquet
+                   data/processed/test_features.parquet
+                   (includes interaction engineering)
+5. train         → models/fold_*_model.pkl + fold_weights.npy + selected_features.pkl
+6. predict       → submissions/submission.csv
+7. validate      → prints OOF RMSLE report
 
 Usage
 -----
+Full pipeline:
     python src/pipeline.py
+
+Specific steps:
+    python src/pipeline.py --steps merge train predict
 """
 
-from __future__ import annotations
-
+import argparse
 import sys
+import time
+import os
+import numpy as np
+import pandas as pd
+from datetime import datetime
 from pathlib import Path
 
-_HERE = Path(__file__).resolve()
-sys.path.insert(0, str(_HERE.parent))   # src/ on path
-sys.path.insert(0, str(_HERE.parents[1]))  # project root on path
 
-import numpy as np                      # noqa: E402
+# ---------------------------------------------------------------------------
+# Step runners
+# ---------------------------------------------------------------------------
 
-from src.modeling.train import (        # noqa: E402
-    load_train,
-    build_feature_matrix,
-    train_kfold,
-)
-from src.modeling.validate import (     # noqa: E402
-    load_oof,
-    load_raw_targets,
-    compute_oof_rmsle,
-    print_validation_report,
-)
-from src.modeling.predict import (      # noqa: E402
-    load_test,
-    extract_test_features,
-    load_fold_models,
-    predict_ensemble,
-    postprocess_predictions,
-    build_submission,
-    save_submission,
-)
-from src.utils.config import CV_N_FOLDS  # noqa: E402
-from src.utils.logger import get_logger  # noqa: E402
-
-logger = get_logger(__name__)
+def run_transactions():
+    from features.build_transactions_features import main
+    print("\n" + "=" * 60)
+    print("STEP 1 — Build transaction features")
+    print("=" * 60)
+    main()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+def run_financials():
+    from features.build_financials_features import main
+    print("\n" + "=" * 60)
+    print("STEP 2 — Build financial features")
+    print("=" * 60)
+    main()
 
-def run_training() -> None:
-    """Execute K-Fold training and persist models + OOF predictions."""
-    logger.info("── Phase 1 / 3 : Training ──────────────────────────────────")
-    df             = load_train()
-    X, y_log, ids  = build_feature_matrix(df)
-    models, oof_df = train_kfold(X, y_log, ids)
 
-    overall_rmse = float(
-        np.sqrt(np.mean(
-            (oof_df["oof_log_pred"].values - oof_df["y_log_true"].values) ** 2
-        ))
+def run_demographics():
+    from features.build_demographics_features import main
+    print("\n" + "=" * 60)
+    print("STEP 3 — Build demographic features")
+    print("=" * 60)
+    main()
+
+
+def run_merge():
+    from features.merge_features import main
+    print("\n" + "=" * 60)
+    print("STEP 4 — Merge + interaction features")
+    print("=" * 60)
+    main()
+
+
+def run_train():
+    from modeling.train import main
+    print("\n" + "=" * 60)
+    print("STEP 5 — Train model (CV + fold ensemble)")
+    print("=" * 60)
+    main()
+
+
+def run_predict():
+    from modeling.predict import main
+    print("\n" + "=" * 60)
+    print("STEP 6 — Generate predictions (fold ensemble)")
+    print("=" * 60)
+    main()
+
+
+def run_validate():
+    from modeling.validate import main
+    print("\n" + "=" * 60)
+    print("STEP 7 — Validate OOF predictions")
+    print("=" * 60)
+    main()
+
+
+# ---------------------------------------------------------------------------
+# Step registry
+# ---------------------------------------------------------------------------
+
+STEP_REGISTRY = {
+    "transactions": run_transactions,
+    "financials":   run_financials,
+    "demographics": run_demographics,
+    "features":     lambda: [run_transactions(), run_financials(), run_demographics()],
+    "merge":        run_merge,
+    "train":        run_train,
+    "predict":      run_predict,
+    "validate":     run_validate,
+}
+
+ALL_STEPS = [
+    "transactions",
+    "financials",
+    "demographics",
+    "merge",
+    "train",
+    "predict",
+    "validate",
+]
+
+
+# ---------------------------------------------------------------------------
+# Metrics logging
+# ---------------------------------------------------------------------------
+
+def log_metrics(rmsle: float, path: str) -> None:
+    row = pd.DataFrame([{
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "rmsle":     round(rmsle, 6),
+    }])
+    os.makedirs(Path(path).parent, exist_ok=True)
+    mode   = "a" if os.path.exists(path) else "w"
+    header = not os.path.exists(path)
+    row.to_csv(path, mode=mode, header=header, index=False)
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(description="Nedbank pipeline orchestrator")
+    parser.add_argument(
+        "--steps",
+        nargs="+",
+        choices=list(STEP_REGISTRY.keys()),
+        default=ALL_STEPS,
+        help="Which steps to run (default: all)",
     )
-    logger.info(
-        "Training complete — %d folds | OOF RMSE(log1p): %.6f",
-        CV_N_FOLDS,
-        overall_rmse,
-    )
+    args = parser.parse_args()
 
+    total_start = time.time()
 
-def run_validation() -> dict[str, float]:
-    """Load OOF predictions and compute RMSLE on the original scale."""
-    logger.info("── Phase 2 / 3 : Validation ────────────────────────────────")
-    oof_df      = load_oof()
-    raw_targets = load_raw_targets()
-    metrics     = compute_oof_rmsle(oof_df, raw_targets)
-    print_validation_report(metrics)
-    return metrics
+    for step in args.steps:
+        step_start = time.time()
+        STEP_REGISTRY[step]()
+        elapsed = time.time() - step_start
+        print(f"  ✓ {step} done in {elapsed:.1f}s")
 
+    # Log RMSLE after validate
+    if "validate" in args.steps:
+        metrics_path = "models/metrics_log.csv"
+        oof_path     = "data/processed/oof_predictions.csv"
+        if os.path.exists(oof_path):
+            oof    = pd.read_csv(oof_path)
+            y_true = oof["next_3m_txn_count_true"].values
+            y_pred = oof["next_3m_txn_count_pred"].values.clip(0)
+            score  = float(np.sqrt(
+                np.mean((np.log1p(y_pred) - np.log1p(y_true)) ** 2)
+            ))
+            log_metrics(score, metrics_path)
+            print(f"[INFO] RMSLE {score:.6f} logged → {metrics_path}")
 
-def run_prediction() -> Path:
-    """Load fold models, ensemble-predict the test set, save submission."""
-    logger.info("── Phase 3 / 3 : Prediction ────────────────────────────────")
-    test_df       = load_test()
-    X_test, ids   = extract_test_features(test_df)
-    boosters      = load_fold_models()
-    log_preds     = predict_ensemble(X_test, boosters)
-    final_preds   = postprocess_predictions(log_preds)
-    submission    = build_submission(ids, final_preds)
-    out_path      = save_submission(submission)
-    return out_path
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-
-def main() -> None:
-    logger.info("═══════════════════════════════════════════════════════════")
-    logger.info("  Nedbank Transaction Forecasting — Full Pipeline")
-    logger.info("═══════════════════════════════════════════════════════════")
-
-    run_training()
-    metrics    = run_validation()
-    out_path   = run_prediction()
-
-    logger.info("═══════════════════════════════════════════════════════════")
-    logger.info("  Pipeline complete")
-    logger.info("  OOF RMSLE        : %.6f", metrics["rmsle"])
-    logger.info("  Submission saved : %s", out_path)
-    logger.info("═══════════════════════════════════════════════════════════")
+    total_elapsed = time.time() - total_start
+    print(f"\n[DONE] Pipeline complete in {total_elapsed:.1f}s")
 
 
 if __name__ == "__main__":
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
     main()
