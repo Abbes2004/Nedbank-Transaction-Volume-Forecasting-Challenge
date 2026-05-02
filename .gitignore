@@ -1,6 +1,7 @@
 # ── Data ─────────────────────────────────────────────────────────────────────
-data/raw/*
-!data/raw/raw_data.zip
+data/raw/
+data/interim/
+data/processed/
 
 data/interim/
 data/processed/
