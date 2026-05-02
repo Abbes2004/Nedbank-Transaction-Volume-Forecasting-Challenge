@@ -3,11 +3,11 @@ data/raw/
 data/interim/
 data/processed/
 
-data/interim/
-data/processed/
-
 # ── Models & generated files ─────────────────────────────────────────────────
 models/
+*.pkl
+*.parquet
+*.txt
 
 # ── Submissions ───────────────────────────────────────────────────────────────
 submissions/*
